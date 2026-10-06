@@ -34,32 +34,62 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 该值 + 全部成功增量之和（首次成功加法已持有写锁直至提交，期间无其他
 连接能修改该行），绝不事后读取别栏新值作为本次结果。失败加法不计入；
 回滚、失败提交、纯读事务不记录；未提交内容不可见；提交重试成功只记
-一次。COMMIT 与记录追加在同一临界区（timeline_lock）完成，编号顺序与
+一次。COMMIT 与编号在同一临界区（timeline_lock）完成，编号顺序与
 实际提交顺序严格一致。采集、查询（GET /api/experiments/<id>/timeline）
 与轮询（/status 的 timeline 字段）都只读内存，不在两栏连接上额外读值、
-不提前建立快照，也不改变最近一次显式读值；时间线无需跨重启保存。
+不提前建立快照，也不改变最近一次显式读值。
+
+值与时间线均持久化在每个实验自己的 SQLite 库里：普通提交把 kv 的
+UPDATE 与 timeline 的 INSERT 放在**同一事务**随同一次 COMMIT 落地；
+补偿连接的 UPDATE 与补偿记录 INSERT 同样同事务提交。因此进程在任意
+时刻被强制终止（SIGKILL / 断电）后，SQLite 的 WAL 恢复只能给出
+「值与记录都生效」或「都未生效」两种状态，不依赖任何退出清理；重启后
+按原 ID 访问即可看到已提交值与完整时间线（含补偿关联 compensates 与
+序号），新提交继续沿末序号编号，末条普通记录仍可补偿。时间线记录先
+在本栏事务内追加（staged），COMMIT 失败时记录随事务保留，重试 COMMIT
+绝不重复追加；成功加法后本栏即使开启了只读（query_only=1），提交路径
+也会在同一事务内临时解除只读以追加记录，COMMIT 后立即恢复只读——
+开关状态对外不变，失败加法 / 纯读提交 / 回滚仍不产生记录。两栏重启后
+重建为无事务、只读关闭、最近显式读值为空；脚本、两栏操作日志与检查点
+结果缓存只保存在内存，不跨重启恢复。启动不再清空 LAB_DATA_DIR，而是
+加载其中 exp_<12位hex>.db 的实验；旧版库（只有 kv 表）首次加载保留
+现值、以空时间线为基线。成功删除的实验库文件已移除，重启后不得复活
+（文件不存在即 404）。
 
 已提交的加法不能用 ROLLBACK 撤回，改为对时间线末条普通提交执行补偿
 （POST /api/experiments/<id>/timeline/compensate，body 为正整数
 {"seq": N}）。仅当末条记录是普通提交且 seq 与其一致时才执行：过期目标、
 补偿（system）记录或有效脚本一律 409，补偿记录不可再补偿。补偿用一条
-全新的独立连接真实提交（自动提交模式的单条 UPDATE），把值恢复为原记录
-的 before；busy_timeout=0，两栏任一事务持有写锁时立即返回 SQLITE_BUSY
-错误名 / 错误码，失败不改库也不改时间线。目标核对、UPDATE 与记录追加
-都在 timeline_lock 内完成，与普通提交的「COMMIT → 追加」互斥：交错时
-重新核对目标，同一 seq 并发最多成功一次。成功按提交顺序追加一条
-side=system 的记录：before/after 对调、deltas 逆序取负、compensates
-记原 seq；原记录保留，普通记录字段不变。全程不触碰两栏长期连接与
-observer：两栏事务、只读模式、最近显式读值与读快照都不受影响（已有读
-快照仍见旧值），也不在两栏连接上额外读值。
+全新的独立连接开启真实事务（DEFERRED 下先 UPDATE、再插入补偿记录，
+同事务 COMMIT），把值恢复为原记录的 before：值与补偿记录随一次 COMMIT
+原子落地，进程在任何时刻终止后二者要么都生效要么都未生效；
+busy_timeout=0，两栏任一事务持有写锁时立即返回 SQLITE_BUSY
+错误名 / 错误码，失败（含未到 COMMIT 的终止）不改库也不改时间线。
+目标核对、UPDATE、INSERT 与内存追加都在 timeline_lock 内完成，与普通
+提交的「追加 → COMMIT → 内存追加」互斥：交错时重新核对目标，同一 seq
+并发最多成功一次。成功按提交顺序追加一条 side=system 的记录：
+before/after 对调、deltas 逆序取负、compensates 记原 seq；原记录保留，
+普通记录字段不变。全程不触碰两栏长期连接与 observer：两栏事务、只读
+模式、最近显式读值与读快照都不受影响（已有读快照仍见旧值），也不在
+两栏连接上额外读值。补偿记录与值一起持久化，重启后 compensates 关联
+与序号完整保留。
 
 删除实验（DELETE /api/experiments/<id>）先在内存门控上标记删除开始，
 并等待此前已进入的请求全部正常完成；删除开始后该实验的操作、状态、
 已提交值与检查点新请求一律返回 410。等待按实验独立，不阻塞其他实验。
 之后才回滚两栏未提交事务、关闭甲、乙长期连接与 observer，再移除
 数据库及 -wal、-shm 文件——此时不存在在途请求或在途检查点连接，
-检查点不可能在删除后重新创建文件。本次运行中已删除 ID 仍返回 410，
-未知 ID 返回 404。
+检查点不可能在删除后重新创建文件。文件移除后实验不再可访问：本次
+运行中已删除 ID 仍返回 410（墓碑），重启后文件已不存在，按未知 ID
+返回 404，成功删除的实验绝不复活；未知 ID 返回 404。
+
+实验跨重启保留：LAB_DATA_DIR 不再于启动时清空，进程启动时扫描目录中
+形如 exp_<12位hex>.db 的库文件并加载（数据损坏 / 无法打开的文件
+跳过，按未知 ID 处理）；请求到达未登记但文件存在的 ID 时也会按需
+加载同一库文件。每个库除单行 kv（旧版库首次加载保留现值）外另有
+timeline 表持久化完整提交时间线；重启后两栏为全新连接：无事务、只读
+关闭、最近显式读值为空；脚本、操作日志、检查点结果缓存只在内存，
+不恢复。
 
 脚本逐步执行：页面与 HTTP 可装载 1～50 步的 JSON 数组（POST
 /api/experiments/<id>/script），每步含 side（a/b）与 op
@@ -95,9 +125,9 @@ in_transaction，与手工 BEGIN 严格互斥：手工 BEGIN 先成功则装载 
 不影响新脚本。
 """
 
+import json
 import os
 import re
-import shutil
 import sqlite3
 import threading
 import time
@@ -188,6 +218,11 @@ class PanelState:
         # 仅供提交时间线使用：COMMIT 成功才生成记录；ROLLBACK / 隐式回滚丢弃；
         # 不随状态接口返回（未提交内容不可见）。
         self.tx_adds = []
+        # 已暂存进当前事务、等待 COMMIT 的时间线记录：首次 COMMIT 前在
+        # timeline_lock 内编号并 INSERT 进本事务；COMMIT 失败（如
+        # SQLITE_BUSY）时随事务保留，重试 COMMIT 直接提交、绝不重复 INSERT；
+        # COMMIT 成功或事务被 SQLite / ROLLBACK 撤销时清空。
+        self.tx_record = None
 
     def add_log(self, text):
         self.log.append("%s  %s" % (time.strftime("%H:%M:%S"), text))
@@ -237,12 +272,13 @@ class Experiment:
         self.active_calls = 0
         self.deleting = False
         self.deleted = False
-        # 提交时间线：只保存在内存，无需跨重启保留。
-        # timeline_lock 保证「COMMIT 成功 → 追加记录」在同一临界区完成，
-        # 记录编号顺序与实际提交顺序严格一致；查询只读内存快照，
-        # 不触碰甲、乙长期连接与 observer。
+        # 提交时间线：内存副本在启动时从库内 timeline 表加载，并与每次
+        # 成功提交 / 补偿在同一临界区内同步追加；跨重启完整保留（含补偿
+        # 的 compensates 关联与序号）。timeline_lock 保证「记录编号 →
+        # COMMIT → 内存追加」在同一临界区完成，记录编号顺序与实际提交
+        # 顺序严格一致；查询只读内存快照，不触碰甲、乙长期连接与 observer。
         self.timeline_lock = threading.Lock()
-        self.timeline = []
+        self.timeline = self._load_timeline()
         # 脚本逐步执行状态：只保存在内存，无需跨重启保留。
         # script_lock 串行化「装载 / 推进 / 跳过 / 取消」与手工操作的
         # active 互斥复查；同实验的脚本动作先在该锁上核对脚本 ID 与步号，
@@ -265,17 +301,63 @@ class Experiment:
         self.script = None  # None 或 {id, steps, cursor, records, status}
 
     def _init_db(self):
+        # 新库建表并写入初值 100；旧版库（只有 kv 表、可能已被改过值）
+        # 保留现值，只补齐 timeline 表——首次加载以空时间线为基线。
+        # 库文件可能带 -wal：先设 WAL 再打开表，SQLite 会自动做崩溃恢复，
+        # 上次未提交（含被 SIGKILL 中断）的事务一律回滚，不留半成品。
         conn = sqlite3.connect(self.db_path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
-                "CREATE TABLE kv (id INTEGER PRIMARY KEY CHECK (id = 1),"
+                "CREATE TABLE IF NOT EXISTS kv (id INTEGER PRIMARY KEY CHECK (id = 1),"
                 " val INTEGER NOT NULL)"
             )
-            conn.execute("INSERT INTO kv (id, val) VALUES (1, 100)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS timeline ("
+                "seq INTEGER PRIMARY KEY,"
+                "side TEXT NOT NULL,"
+                "before_val INTEGER NOT NULL,"
+                "after_val INTEGER NOT NULL,"
+                "deltas TEXT NOT NULL,"
+                "compensates INTEGER)"
+            )
+            # 空表才插入初值：全新库得到 100；旧版库保留 kv 现值，绝不
+            # 重置；旧库异常缺行时补一行，保证单行不变量。
+            row = conn.execute("SELECT val FROM kv WHERE id = 1").fetchone()
+            if row is None:
+                conn.execute("INSERT INTO kv (id, val) VALUES (1, 100)")
             conn.commit()
         finally:
             conn.close()
+
+    def _load_timeline(self):
+        """从库内 timeline 表重建内存时间线（按 seq 升序）。
+
+        deltas 以 JSON 文本持久化（均为整数，加载回 Python int，无损）；
+        补偿记录额外恢复 compensates。旧版库首次加载时表刚由 _init_db
+        建好，返回空列表（以空时间线为基线，现值保留在 kv）。
+        """
+        records = []
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT seq, side, before_val, after_val, deltas, compensates "
+                "FROM timeline ORDER BY seq"
+            ).fetchall()
+        finally:
+            conn.close()
+        for seq, side, before, after, deltas_json, compensates in rows:
+            record = {
+                "seq": seq,
+                "side": side,
+                "before": before,
+                "after": after,
+                "deltas": json.loads(deltas_json),
+            }
+            if compensates is not None:
+                record["compensates"] = compensates
+            records.append(record)
+        return records
 
     def _open_conn(self, overflow_flag=None, add_base_slot=None, autockpt=True):
         conn = sqlite3.connect(
@@ -325,14 +407,15 @@ class Experiment:
             ).fetchone()
             return row[0]
 
-    def append_timeline(self, side, tx_adds):
-        """COMMIT 成功后追加一条时间线记录；调用方必须持有 timeline_lock，
-        使「COMMIT → 追加」原子完成，记录顺序与实际提交顺序一致。
+    @staticmethod
+    def build_timeline_record(seq, side, tx_adds, compensates=None):
+        """根据已编号 seq 与本事务成功增量构造一条时间线记录。
 
         before 取自本事务首次成功加法时 checked_add 在 UPDATE 语句内捕获的
         行值（事务自身视图）；after = before + 全部成功增量之和——首次成功
         加法已持有写锁直至提交，期间无其他连接能修改该行，因此提交后的值
-        无需、也绝不允许事后读取别栏新值得到。
+        无需、也绝不允许事后读取别栏新值得到。补偿记录由调用方直接给定
+        before / after / deltas（见 run_compensate），不经此路径。
         """
         before = tx_adds[0][0]
         after = before
@@ -340,17 +423,46 @@ class Experiment:
         for _base, delta in tx_adds:
             after += delta
             deltas.append(delta)
-        # 内部保存原始整数（无损）；对外视图在 timeline_records /
-        # run_compensate 出口经 json_int 编码，普通记录字段不变。
-        self.timeline.append(
-            {
-                "seq": len(self.timeline) + 1,
-                "side": side,
-                "before": before,
-                "after": after,
-                "deltas": deltas,
-            }
+        record = {
+            "seq": seq,
+            "side": side,
+            "before": before,
+            "after": after,
+            "deltas": deltas,
+        }
+        if compensates is not None:
+            record["compensates"] = compensates
+        return record
+
+    @staticmethod
+    def stage_timeline_record(conn, record):
+        """把时间线记录插入调用方当前开启的写事务（不提交）。
+
+        与 kv 的 UPDATE 同事务：随后只有一次 COMMIT，值与记录原子落地；
+        进程在 COMMIT 前被杀死时二者都随 WAL 恢复回滚，COMMIT 后都保留。
+        deltas 以 JSON 文本保存（元素均为 int，64 位范围内无损）。
+        """
+        conn.execute(
+            "INSERT INTO timeline (seq, side, before_val, after_val, deltas, compensates)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                record["seq"],
+                record["side"],
+                record["before"],
+                record["after"],
+                json.dumps(record["deltas"]),
+                record.get("compensates"),
+            ),
         )
+
+    def append_timeline_record_locked(self, record):
+        """COMMIT 成功后把已构造的记录追加进内存副本；调用方必须持有
+        timeline_lock，使「编号 → 入库暂存 → COMMIT → 内存追加」原子完成，
+        记录顺序与实际提交顺序一致。内部保存原始整数（无损）；对外视图在
+        timeline_records / run_compensate 出口经 json_int 编码，普通记录
+        字段不变。
+        """
+        self.timeline.append(record)
 
     def _timeline_view_locked(self):
         # 时间线对外视图；调用方必须持有 timeline_lock
@@ -691,6 +803,7 @@ def run_op(exp, side, op, value):
                 conn.execute("BEGIN DEFERRED")
                 # 新事务从空的待记录增量开始（正常已为空，防御性重置）
                 panel.tx_adds = []
+                panel.tx_record = None
                 panel.tx_has_snapshot = False
                 panel.add_log("BEGIN DEFERRED → 成功，事务已开启")
             elif op == "read":
@@ -746,35 +859,83 @@ def run_op(exp, side, op, value):
             elif op == "commit":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
-                if panel.tx_adds:
-                    # 本事务有成功加法：COMMIT 与记录追加在同一临界区完成，
-                    # 时间线编号顺序与实际提交顺序严格一致；COMMIT 失败时
-                    # 异常直接抛出，不记录、tx_adds 保留，事务仍开启，
-                    # 之后重试 COMMIT 成功只记录一次。
-                    with exp.timeline_lock:
+                # 只读开关在成功加法之后开启时，本连接处于
+                # PRAGMA query_only=1：COMMIT 本身仍被 SQLite 允许，但时间线
+                # INSERT 会被如实拒绝（SQLITE_READONLY 8）。提交路径因此在
+                # 同一事务内临时解除只读以追加记录，COMMIT 后立即恢复，开关
+                # 对外状态（panel.readonly）始终不变。query_only=0 只是
+                # PRAGMA 设置、不写库，在 query_only=1 下同样可执行。
+                restore_readonly = panel.readonly
+                try:
+                    if panel.tx_adds:
+                        # 本事务有成功加法：编号与入库在同一临界区完成，时间线
+                        # 编号顺序与实际提交顺序严格一致。kv 的 UPDATE 早已在
+                        # 本事务内，这里再把 timeline 行 INSERT 进**同一事务**，
+                        # 随后只有一次 COMMIT：值与记录原子落地，进程在任意
+                        # 时刻终止都只能恢复二者同时生效或同时未生效。
+                        with exp.timeline_lock:
+                            if restore_readonly:
+                                conn.execute("PRAGMA query_only=0")
+                            if panel.tx_record is None:
+                                record = exp.build_timeline_record(
+                                    len(exp.timeline) + 1, side, panel.tx_adds
+                                )
+                                exp.stage_timeline_record(conn, record)
+                                # 暂存记录：COMMIT 失败时行随事务保留，重试
+                                # COMMIT 绝不再重复 INSERT。
+                                panel.tx_record = record
+                            else:
+                                # 防御：首次 COMMIT 失败后、用户又在同一事务
+                                # 追加成功加法（罕见的非锁类提交失败），按当前
+                                # 增量在同一事务内校正已暂存的同一 seq 行
+                                # （DELETE + INSERT 仍随本次 COMMIT 原子生效）。
+                                fresh = exp.build_timeline_record(
+                                    panel.tx_record["seq"], side, panel.tx_adds
+                                )
+                                if fresh != panel.tx_record:
+                                    conn.execute(
+                                        "DELETE FROM timeline WHERE seq = ?",
+                                        (panel.tx_record["seq"],),
+                                    )
+                                    exp.stage_timeline_record(conn, fresh)
+                                    panel.tx_record = fresh
+                            conn.execute("COMMIT")
+                            exp.append_timeline_record_locked(panel.tx_record)
+                        panel.tx_adds = []
+                        panel.tx_record = None
+                    else:
+                        # 纯读事务（或只有失败加法）：照常提交，不产生记录
                         conn.execute("COMMIT")
-                        exp.append_timeline(side, panel.tx_adds)
-                    panel.tx_adds = []
-                else:
-                    # 纯读事务（或只有失败加法）：照常提交，不产生记录
-                    conn.execute("COMMIT")
+                finally:
+                    # 无论提交成功、失败还是被异常打断，都把本栏连接恢复到
+                    # 开关声明的只读状态：成功路径在 COMMIT 后恢复（开关不被
+                    # 提交重置）；失败路径事务仍在、记录已在事务内暂存，恢复
+                    # 后可在原事务重试 COMMIT。此时仍持有本栏 conn_lock，
+                    # 中间不存在可被用户写操作穿插的窗口。
+                    if restore_readonly:
+                        conn.execute("PRAGMA query_only=1")
                 panel.tx_has_snapshot = False
                 panel.add_log("COMMIT → 成功，事务已提交")
             elif op == "rollback":
                 if not conn.in_transaction:
                     return reject("当前没有开启的事务")
                 conn.execute("ROLLBACK")
-                # 回滚不产生时间线记录，丢弃本事务待记录的增量
+                # 回滚不产生时间线记录，丢弃本事务待记录的增量与暂存记录
                 panel.tx_adds = []
+                panel.tx_record = None
                 panel.tx_has_snapshot = False
                 panel.add_log("ROLLBACK → 成功，事务已回滚")
             else:
                 return reject("未知操作：%s" % op)
         except sqlite3.Error as exc:
             # 个别错误会让 SQLite 隐式回滚整个事务：若事务已不存在，
-            # 丢弃待记录的增量，已被撤销的写入绝不进入时间线
+            # 丢弃待记录的增量与已暂存记录，已被撤销的写入绝不进入时间线。
+            # 若事务仍开启（典型如 COMMIT 返回 SQLITE_BUSY），kv 改动与
+            # 已暂存的 timeline 行都随事务保留，重试 COMMIT 直接提交、
+            # 绝不重复追加记录。
             if not conn.in_transaction:
                 panel.tx_adds = []
+                panel.tx_record = None
             # checked_add 置位溢出标志时，这不是锁冲突而是越界拒绝：
             # 语句已终止、行未修改、事务保持开启，沿用既有拒绝响应。
             if exp.overflow_flags[side][0]:
@@ -896,13 +1057,16 @@ def run_compensate(exp, seq):
 
     仅当末条记录是普通提交且 seq 与其一致时才执行；过期目标、补偿
     （system）记录与有效脚本一律由调用方返回 409，补偿记录不可再补偿。
-    用一条全新的独立连接真实提交（自动提交模式的单条 UPDATE，
-    busy_timeout=0）：两栏任一事务持有写锁时立即返回 SQLITE_BUSY 的
-    错误名 / 错误码，失败不改库也不改时间线。目标核对、UPDATE 与记录
-    追加都在 timeline_lock 内完成，与普通提交的「COMMIT → 追加」互斥：
-    交错时重新核对目标，同一 seq 并发最多成功一次。全程不触碰两栏长期
-    连接与 observer：两栏事务、只读模式、最近显式读值与读快照都不受
-    影响（已有读快照仍见旧值），也不在两栏连接上额外读值。
+    用一条全新的独立连接开启真实事务（DEFERRED：先 UPDATE 恢复值、再
+    INSERT 补偿记录，同事务一次 COMMIT），busy_timeout=0：两栏任一事务
+    持有写锁时 UPDATE 立即返回 SQLITE_BUSY 的错误名 / 错误码。值与补偿
+    记录随一次 COMMIT 原子落地，进程在任何时刻终止只能恢复二者同时生效或
+    同时未生效；失败（含未到 COMMIT 的终止）不改库也不改时间线。目标
+    核对、UPDATE、INSERT 与内存追加都在 timeline_lock 内完成，与普通
+    提交的「暂存 → COMMIT → 内存追加」互斥：交错时重新核对目标，同一
+    seq 并发最多成功一次。全程不触碰两栏长期连接与 observer：两栏事务、
+    只读模式、最近显式读值与读快照都不受影响（已有读快照仍见旧值），也
+    不在两栏连接上额外读值。
 
     返回 (result, conflict)：conflict 非 None 时调用方返回 409。
     """
@@ -925,32 +1089,10 @@ def run_compensate(exp, seq):
                 return None, {
                     "error": "compensation records cannot be compensated"
                 }
-            # 独立连接真实提交：不用两栏长期连接与 observer，避免把补偿与
-            # 两栏事务、读快照绑定；busy_timeout=0 使写锁冲突立即报错。
-            comp_conn = sqlite3.connect(
-                exp.db_path, timeout=0, isolation_level=None
-            )
-            try:
-                comp_conn.execute("PRAGMA busy_timeout=0")
-                comp_conn.execute(
-                    "UPDATE kv SET val = ? WHERE id = 1", (target["before"],)
-                )
-            except sqlite3.Error as exc:
-                # 写锁冲突等：如实返回 SQLite 错误名 / 错误码；
-                # 语句未生效，库与时间线都保持原样
-                name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
-                code = getattr(exc, "sqlite_errorcode", None)
-                return {
-                    "ok": False,
-                    "error": {"name": name, "code": code, "message": str(exc)},
-                    "timeline": exp._timeline_view_locked(),
-                }, None
-            finally:
-                comp_conn.close()
-            # 成功：按提交顺序追加补偿记录。before/after 对调（末条记录的
-            # after 即当前已提交值——值的一切变化都有记录，且本临界区与
-            # 普通提交互斥），deltas 逆序取负，compensates 记原 seq；
-            # 原记录保留，普通记录字段不变。
+            # 按提交顺序构造补偿记录：before/after 对调（末条记录的 after
+            # 即当前已提交值——值的一切变化都有记录，且本临界区与普通提交
+            # 互斥），deltas 逆序取负，compensates 记原 seq；原记录保留，
+            # 普通记录字段不变。
             record = {
                 "seq": len(exp.timeline) + 1,
                 "side": "system",
@@ -959,6 +1101,41 @@ def run_compensate(exp, seq):
                 "deltas": [-delta for delta in reversed(target["deltas"])],
                 "compensates": target["seq"],
             }
+            # 独立连接开启真实事务：不用两栏长期连接与 observer，避免把
+            # 补偿与两栏事务、读快照绑定；busy_timeout=0 使写锁冲突立即报错。
+            # UPDATE 与补偿记录 INSERT 同事务一次 COMMIT：值与记录原子落地，
+            # COMMIT前任一步失败或进程被杀，连接关闭 / WAL 恢复时整笔回滚。
+            comp_conn = sqlite3.connect(
+                exp.db_path, timeout=0, isolation_level=None
+            )
+            try:
+                comp_conn.execute("PRAGMA busy_timeout=0")
+                comp_conn.execute("BEGIN DEFERRED")
+                try:
+                    comp_conn.execute(
+                        "UPDATE kv SET val = ? WHERE id = 1", (target["before"],)
+                    )
+                    exp.stage_timeline_record(comp_conn, record)
+                    comp_conn.execute("COMMIT")
+                except sqlite3.Error as exc:
+                    # 写锁冲突等：如实返回 SQLite 错误名 / 错误码；
+                    # 事务未提交，ROLLBACK 兜底（连接关闭同样会撤销），
+                    # 库与时间线（磁盘与内存）都保持原样
+                    try:
+                        if comp_conn.in_transaction:
+                            comp_conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+                    code = getattr(exc, "sqlite_errorcode", None)
+                    return {
+                        "ok": False,
+                        "error": {"name": name, "code": code, "message": str(exc)},
+                        "timeline": exp._timeline_view_locked(),
+                    }, None
+            finally:
+                comp_conn.close()
+            # COMMIT 成功后才追加内存副本（磁盘与内存严格一致）
             exp.timeline.append(record)
             return {
                 "ok": True,
@@ -968,24 +1145,61 @@ def run_compensate(exp, seq):
             }, None
 
 
-# 实验注册表：仅保存在内存中，无需跨重启保留。
+# 实验注册表：内存登记，实验数据（kv + timeline）持久化在 LAB_DATA_DIR
+# 的各库文件里，进程重启后启动扫描重新登记；ID 形如 12 位小写十六进制。
 # 删除后的对象不从这里摘除，而是以墓碑（deleted=True）保留：
 # 任何准入请求都返回 410，并供并发 DELETE 等待者等待收尾结束。
+# 成功删除同时移除库文件，重启后文件不存在，按未知 ID 返回 404——
+# 已成功删除的实验绝不复活。
 experiments = {}
 experiments_lock = threading.Lock()
 # 本次运行中已经删除的实验 ID 集合（与注册表墓碑保持一致）
 deleted_experiments = set()
+
+# exp_<12位hex>.db：文件名即实验 ID，与新建 ID 的形态一致
+DB_FILE_PATTERN = re.compile(r"^exp_([0-9a-f]{12})\.db$")
+
+
+def load_experiment_from_disk(exp_id):
+    """若磁盘上存在该 ID 的库文件，则登记并返回实验对象，否则返回 None。
+
+    必须持有 experiments_lock 调用：文件检查、Experiment 构造（打开库、
+    WAL 崩溃恢复、加载时间线）与登记在同一临界区完成，并发的同 ID 请求
+    只会构造一次；构造过程的 SQLite 错误（文件损坏等）不外泄——按未知
+    ID 处理（404），不影响其他实验与启动。
+    """
+    if exp_id in deleted_experiments:
+        return None
+    if not DB_FILE_PATTERN.fullmatch("exp_%s.db" % exp_id):
+        return None
+    existing = experiments.get(exp_id)
+    if existing is not None:
+        return existing
+    db_path = os.path.join(DATA_DIR, "exp_%s.db" % exp_id)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        exp = Experiment(exp_id)
+    except sqlite3.Error:
+        # 库文件损坏 / 无法打开：不当作可恢复的实验
+        return None
+    experiments[exp_id] = exp
+    return exp
 
 
 def admit_experiment(exp_id):
     """解析请求目标：
 
     返回 (exp, response)。存活并准入成功时 response 为 None；
-    本次运行中删除过的 ID 返回 410；未知 ID 返回 404。
+    本次运行中删除过的 ID 返回 410；未知 ID（磁盘上也无库文件）返回 404。
+    重启后登记表里没有、但库文件仍在的实验在此按需加载，随后按原 ID 访问。
     准入成功的请求必须在 finally 中调用 exp.finish_call()。
     """
     with experiments_lock:
         exp = experiments.get(exp_id)
+        if exp is None and exp_id not in deleted_experiments:
+            # 启动扫描之外的兜底：文件存在即恢复登记（值与时间线从库加载）
+            exp = load_experiment_from_disk(exp_id)
         was_deleted = exp_id in deleted_experiments
     if exp is not None:
         # active_calls 在独立的实验门控上自增，不持有 experiments_lock
@@ -1004,9 +1218,20 @@ def index():
 
 @app.post("/api/experiments")
 def create_experiment():
-    exp_id = uuid.uuid4().hex[:12]
-    exp = Experiment(exp_id)
+    # ID 必须避开磁盘上已有的库文件（重启后 ID 空间重叠概率极低，但文件名
+    # 是唯一真相，碰撞即重试）；构造在锁内完成，避免两个并发新建登记到
+    # 同一个新 ID。
     with experiments_lock:
+        while True:
+            exp_id = uuid.uuid4().hex[:12]
+            db_path = os.path.join(DATA_DIR, "exp_%s.db" % exp_id)
+            if (
+                exp_id not in experiments
+                and exp_id not in deleted_experiments
+                and not os.path.exists(db_path)
+            ):
+                break
+        exp = Experiment(exp_id)
         experiments[exp_id] = exp
         # 全新 ID，不会与已删除集合冲突；保险起见若被复用则移除旧墓碑
         deleted_experiments.discard(exp_id)
@@ -1020,6 +1245,9 @@ def delete_experiment(exp_id):
     # 删除后的实验对象保留在注册表中（墓碑），等待者可等待其收尾。
     with experiments_lock:
         exp = experiments.get(exp_id)
+        if exp is None:
+            # 重启后未被启动扫描登记、但库文件仍在的实验：先按需加载再删除
+            exp = load_experiment_from_disk(exp_id)
         if exp is None:
             if exp_id in deleted_experiments:
                 # 本次运行中已删除的 ID：再次删除仍返回 410
@@ -1316,13 +1544,37 @@ def experiment_set_readonly(exp_id, side):
 
 
 def prepare_data_dir():
-    # 实验无需跨重启保留：启动时清空旧数据库文件
-    if os.path.isdir(DATA_DIR):
-        shutil.rmtree(DATA_DIR, ignore_errors=True)
+    # 实验跨重启保留：启动绝不清空 LAB_DATA_DIR，只确保目录存在。
+    # 库内实验由 discover_experiments() 扫描登记。
     os.makedirs(DATA_DIR, exist_ok=True)
 
 
+def discover_experiments():
+    """启动时扫描 DATA_DIR，把 exp_<12位hex>.db 全部恢复登记。
+
+    每个库由 Experiment 构造打开（WAL 自动做崩溃恢复、加载 kv 现值与
+    timeline 全量记录）；文件损坏 / 无法打开的库跳过，按未知 ID 处理，
+    不影响其他实验。旧版库（只有 kv）保留现值、以空时间线为基线。
+    """
+    recovered = 0
+    with experiments_lock:
+        for name in os.listdir(DATA_DIR):
+            match = DB_FILE_PATTERN.fullmatch(name)
+            if match is None:
+                continue
+            exp_id = match.group(1)
+            if exp_id in experiments or exp_id in deleted_experiments:
+                continue
+            try:
+                experiments[exp_id] = Experiment(exp_id)
+            except sqlite3.Error:
+                continue
+            recovered += 1
+    return recovered
+
+
 prepare_data_dir()
+discover_experiments()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, threaded=True)

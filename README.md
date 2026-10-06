@@ -5,6 +5,16 @@
 - 后端：Python + Flask（直接调用标准库 `sqlite3`，真实执行 SQL）
 - 前端：原生 HTML / CSS / JavaScript，无任何框架
 - 每次「新建实验」都会得到一个独立的 WAL 数据库，内含单行整数值 `100`
+- **实验跨重启持久化**：每个实验库（`LAB_DATA_DIR` 下的
+  `exp_<12位hex>.db`）除单行值外还保存完整**提交时间线**；`docker compose`
+  以命名卷挂载 `/app/data`，服务重启、`docker compose restart`、主机重启或
+  进程被强制终止（SIGKILL / 断电）后，SQLite 的 WAL 崩溃恢复保证已提交的
+  **值与时间线记录原子共存**（同一次 COMMIT 落地，二者要么都在要么都不在），
+  实验仍可**按原 ID** 访问，时间线（含补偿关联与序号）完整、编号继续递增。
+  重启后两栏重建为**无事务、只读关闭、最近读值为空**；脚本、两栏操作日志与
+  检查点结果缓存只在内存，不恢复；未提交事务随崩溃回滚。旧版库（只有值表）
+  首次加载**保留现值、以空时间线为基线**。成功删除的实验库文件被移除，重启后
+  **不复活**（原 ID 返回 404）
 - 页面左右两栏（甲 / 乙）各自绑定一条**长期独立连接**，可执行
   `BEGIN DEFERRED`、读值、加上输入整数、提交、回滚
 - 第三条连接单独显示**已提交值**
@@ -47,21 +57,28 @@
   `checked_add` 在语句执行时捕获（事务自身视图），提交后的值 = 该值 + 全部
   成功增量之和，绝不事后读取别栏新值作为本次结果；采集、查询与轮询都不在
   两栏连接上额外读值、不提前建立快照，也不改变最近一次显式读值；`COMMIT`
-  与记录追加在同一临界区完成，编号顺序与实际提交顺序严格一致；时间线只
-  保存在内存，无需跨重启保留
+  与编号在同一临界区完成，编号顺序与实际提交顺序严格一致。时间线记录与值在
+  **同一 SQLite 事务**内随一次 `COMMIT` 原子落地（普通提交把时间线行先
+  `INSERT` 进本栏当前事务；补偿用独立连接开事务同时写值与补偿记录），因此
+  进程在任意时刻被强制终止后只能恢复二者同时生效或同时未生效，**不依赖退出
+  清理**；时间线与值一起持久化在实验库内，重启后完整恢复（含补偿关联）
 - **补偿末条提交**（时间线区块输入序号，或
   `POST /api/experiments/<id>/timeline/compensate`，body 为正整数
   `{"seq": N}`）：已提交的加法不能用 `ROLLBACK` 撤回，改为对时间线
-  **末条普通提交**执行补偿——后端用一条**全新的独立连接**真实提交，把值
+  **末条普通提交**执行补偿——后端用一条**全新的独立连接开启真实事务**
+  （`BEGIN` → 恢复值的 `UPDATE` → 插入补偿记录 → 一次 `COMMIT`），把值
   恢复为该记录的 `before`，并按提交顺序追加一条 `side=system` 的补偿记录
   （`before`/`after` 对调、增量**逆序取负**、`compensates` 记原 seq；
-  原记录保留，普通记录字段不变）。仅末条普通提交可补偿：**过期序号、
-  补偿记录或脚本有效期间返回 `409`**，补偿记录不可再补偿；`busy_timeout=0`，
-  两栏持写锁时立即返回 `SQLITE_BUSY` 错误名 / 错误码，**失败不改库也不改
-  时间线**；目标核对与记录追加和普通提交的「COMMIT → 追加」在同一临界区
+  原记录保留，普通记录字段不变）。值与补偿记录随一次 `COMMIT` **原子落地**，
+  进程在任意时刻终止只能恢复二者同时生效或同时未生效。仅末条普通提交可补偿：
+  **过期序号、补偿记录或脚本有效期间返回 `409`**，补偿记录不可再补偿；
+  `busy_timeout=0`，两栏持写锁时立即返回 `SQLITE_BUSY` 错误名 / 错误码，
+  **失败（含未到 COMMIT 的终止）不改库也不改时间线**；目标核对与
+  `UPDATE` / `INSERT` 和普通提交的「暂存 → COMMIT → 内存追加」在同一临界区
   互斥，交错时重新核对目标，**同一 seq 并发最多成功一次**。补偿不触碰两栏
   长期连接与 observer：两栏事务、只读模式、最近显式读值与读快照都不受影响
-  （已有读快照仍见旧值），也不在两栏连接上额外读值；大整数沿用无损编码
+  （已有读快照仍见旧值），也不在两栏连接上额外读值；大整数沿用无损编码，
+  补偿记录与值一起持久化，重启后关联与序号完整保留
 - 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
   此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
   一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
@@ -80,7 +97,9 @@
   「新建实验失败」错误，旧实验操作**仍全部禁用、轮询保持停止**；手动重试成功后
   才解除冻结、为新 ID 启用控件并恢复轮询。存活页面上新建失败则恢复旧实验的
   控件与轮询，并立即重新拉取旧实验状态
-- 实验仅保存在内存中，无需跨重启保留
+- 实验的已提交值与提交时间线持久化在 `LAB_DATA_DIR`（容器内 `/app/data`，
+  Compose 以命名卷持久化）；两栏操作日志、脚本、检查点结果缓存只在内存，
+  重启后清空。启动不再清空数据目录，而是扫描其中的实验库恢复登记
 
 ## 脚本逐步执行
 
@@ -315,7 +334,116 @@ curl -s -X DELETE $BASE                                            # {"deleted":
 docker compose up --build
 ```
 
-访问：<http://localhost:8000>
+访问：<http://localhost:8000>（原 Dockerfile、启动命令与端口 / 地址均不变）。
+
+`docker-compose.yml` 把容器内 `LAB_DATA_DIR=/app/data` 挂载到命名卷 `lab-data`：
+实验库（已提交值 + 提交时间线）写入该卷，容器重启、`docker compose restart`、
+`docker compose stop && docker compose up`、主机重启后都保留；只有显式删除实验
+（`DELETE`）才会从卷中移除对应库文件。直接运行 `python app.py`（不经 Compose）
+时，`LAB_DATA_DIR` 默认为仓库下的 `data/` 目录，同样持久化、启动不清空。
+
+## 重启 / 强制终止后按原 ID 查询与补偿
+
+实验 ID 就是库文件名（`data/exp_<id>.db`），重启后服务扫描数据目录恢复登记，
+浏览器地址栏的 `?exp=<id>` 与全部 HTTP 接口都直接可用，无需重新新建。下面示例
+先做两笔普通提交并补偿，再分别用「普通重启」和「SIGKILL 强杀」验证值与时间线
+（含 `compensates` 关联、序号）原样恢复，恢复后继续编号、末条普通记录仍可补偿。
+
+```bash
+# 1) 建实验并记下原 ID
+EXP=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+BASE=http://localhost:8000/api/experiments/$EXP
+echo "$EXP"        # 例如 0baa72426aa5
+
+# 2) 甲提交 +5、+7（#1: 100→112），补偿 #1（#2 system 112→100），
+#    乙再提交 +3（#3: 100→103）
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":5}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":7}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}' >/dev/null
+curl -s -X POST $BASE/timeline/compensate -H 'Content-Type: application/json' \
+  -d '{"seq":1}' >/dev/null
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' >/dev/null
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":3}' >/dev/null
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}' >/dev/null
+
+# 3) 普通重启容器（服务重启 / 主机重启等价；数据在命名卷中）
+docker compose restart web
+
+# 4) 按原 ID 查询：值 103，时间线三条，#2 的 compensates=1 完整保留
+curl -s $BASE/committed
+# {"committed":103}
+curl -s $BASE/timeline
+# {"timeline":[
+#   {"seq":1,"side":"a","before":100,"after":112,"deltas":[5,7]},
+#   {"seq":2,"side":"system","before":112,"after":100,
+#    "deltas":[-7,-5],"compensates":1},
+#   {"seq":3,"side":"b","before":100,"after":103,"deltas":[3]}]}
+
+# 5) 恢复后编号继续：甲 +4 提交为 #4（103→107），并立即补偿 #4 → #5
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":4}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}' >/dev/null
+curl -s -X POST $BASE/timeline/compensate -H 'Content-Type: application/json' \
+  -d '{"seq":4}'
+# {"ok":true,...,"record":{"seq":5,"side":"system","before":107,"after":103,
+#   "deltas":[-4],"compensates":4}, ...}
+```
+
+### 进程被强制终止（SIGKILL / 断电）
+
+值的 `UPDATE` 与时间线记录的 `INSERT` 在**同一事务**内随一次 `COMMIT` 落地，
+因此 SIGKILL 后 SQLite 的 WAL 恢复只会给出「二者都生效」或「二者都未生效」，
+不依赖任何退出清理钩子；未提交事务一律回滚，两栏重建为无事务、只读关闭、
+最近读值为空（脚本、操作日志、检查点缓存本就只在内存）。
+
+```bash
+# 接上例：在新终端找到服务进程并 SIGKILL（docker compose 场景等价于
+# 直接 kill -9 容器主进程，或 docker kill -s KILL web）
+pkill -9 -f 'python app.py'
+# Docker：
+# docker kill -s KILL "$(docker compose ps -q web)"
+
+# 重新启动（原命令、原端口、原卷）
+docker compose up -d
+
+# 按原 ID 访问：已提交值与完整时间线原样恢复，未提交内容消失
+curl -s $BASE/committed            # 103（#4/#5 已补偿，值回到 103）
+curl -s $BASE/timeline | python3 -m json.tool
+# 两栏状态均为无事务 / 只读关闭 / last_read=null，script=null
+curl -s $BASE/status | python3 -c 'import sys,json;s=json.load(sys.stdin);print(s["a"],s["b"],s["script"])'
+# ... {'in_transaction': False, 'readonly': False, 'last_read': None, ...} None
+
+# 恢复后仍可继续提交（#6）并补偿末条普通记录
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":9}' >/dev/null
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}' >/dev/null
+curl -s -X POST $BASE/timeline/compensate -H 'Content-Type: application/json' \
+  -d '{"seq":6}'                  # ok:true，追加 #7 system，compensates=6
+```
+
+> 原子性说明：普通提交把时间线行先 `INSERT` 进本栏当前事务（成功加法后即使
+> 开启了只读，提交路径也会在同一事务内临时解除只读写记录、`COMMIT` 后立即
+> 恢复，开关对外不变）；失败加法 / 纯读提交 / 回滚不写记录。`COMMIT` 失败时
+> 记录随事务保留，重试 `COMMIT` 不会重复插入。补偿由独立连接开事务同时写值
+> 与补偿记录。因此任何时刻被杀，都不会出现「值改了但没记录」或「有记录但值
+> 没改」。旧版库（只有值表）首次启动保留现值、以空时间线为基线；已成功删除的
+> 实验库文件不存在，重启后原 ID 返回 **404**，不会复活。浏览器直接打开
+> `http://localhost:8000/?exp=<原ID>` 也会恢复同一实验页面（两栏为干净初始态）。
 
 ## 前端交错问题的复现
 
@@ -444,6 +572,19 @@ python3 tests/backend_script.py
 
 ```bash
 python3 tests/backend_compensate.py
+```
+
+`tests/backend_persistence.py` 覆盖跨重启持久化：进程内用全新 `Experiment`
+重开同一库文件验证已提交值与完整时间线（含 `compensates`、序号接续）恢复、
+两栏重建为无事务 / 只读关闭 / 最近读值空、脚本 / 操作日志 / 检查点缓存不恢复、
+恢复后继续编号且末条普通记录仍可补偿、成功加法后开启只读仍可提交（失败加法 /
+纯读提交 / 回滚不产生记录）、首次 COMMIT 失败重试不重复记录、旧版库保留现值
+以空时间线为基线、删除的实验不复活；并派生**真实子进程**经 HTTP 在「已提交后
+另有未提交事务」时点 `SIGKILL` 强杀、重启后按原 ID 查询（未提交整笔消失、
+已提交的值与记录同时在）、再继续提交与补偿、删除后重启返回 404：
+
+```bash
+python3 tests/backend_persistence.py
 ```
 
 `tests/compensate.test.js` 用假 `fetch` 环境覆盖补偿控件的前端行为：正整数
@@ -751,7 +892,7 @@ curl -s http://localhost:8000/api/experiments/$EXP/status
 > 不产生记录的情形：事务只有读值（纯读事务）、加法全部失败（如 SQLITE_BUSY /
 > SQLITE_READONLY / 越界拒绝）、`回滚` 收尾、`提交` 失败（重试成功才记录一次）。
 > 大整数同样无损：超出 ±2⁵³−1 的 `before` / `after` / `deltas` 以十进制字符串
-> 返回。时间线只保存在内存，随实验删除或重启消失，无需跨重启保留。
+> 返回。时间线与值持久化在实验库中，重启后完整保留；仅删除实验才移除。
 
 ### 示例七：脚本逐步执行——乙遇写锁后跳过、甲提交、乙再次加法
 

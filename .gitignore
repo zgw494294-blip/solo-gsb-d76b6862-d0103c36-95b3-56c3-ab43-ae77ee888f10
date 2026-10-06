@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
+# 本地运行产生的实验库不入库；容器内通过 docker compose 命名卷持久化
+# （LAB_DATA_DIR=/app/data）。
 data/

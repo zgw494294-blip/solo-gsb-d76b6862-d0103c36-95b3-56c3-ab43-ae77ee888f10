@@ -3,3 +3,14 @@ services:
     build: .
     ports:
       - "8000:8000"
+    environment:
+      # 与 Dockerfile 内默认值一致；显式写出便于与下面的卷对应
+      LAB_DATA_DIR: /app/data
+    volumes:
+      # 实验数据库（已提交值 + 提交时间线）持久化在命名卷中：
+      # docker compose restart / stop+up / 主机重启 / 进程被强制终止后，
+      # 实验仍可按原 ID 访问。删除实验会移除对应库文件，卷中不会复活。
+      - lab-data:/app/data
+
+volumes:
+  lab-data:
